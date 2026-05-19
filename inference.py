@@ -1,107 +1,88 @@
 import torch
-import pandas as pd
-import numpy as np
 from kan import KAN
-from pytorch_forecasting import TemporalFusionTransformer
-from main import download_mtf_data, prepare_features
-from sklearn.preprocessing import StandardScaler
+import data_utils
+import model_utils
+import warnings
 
-def run_inference(ticker="PTBA.JK"):
-    # 1. Load Data
-    print(f"Loading fresh data for {ticker}...")
-    d15, d1h, dd = download_mtf_data(ticker)
-    df = prepare_features(d15, d1h, dd)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+def load_deployed_model(checkpoint_dir="./model"):
+    # The KAN library creates checkpoints with _state and _cache_data
+    # We need to initialize the model first
+    model = KAN(width=[7, 1], grid=10, k=3, device="cpu")
     
-    features = ['log_return', 'smoothed_log', 'log_return_h1', 'log_return_d1', 'z_score_sr']
-    X = df[features].values
+    # Load state manually
+    try:
+        # Based on library source: torch.save(model.state_dict(), f'{path}_state')
+        # And torch.save(model.cache_data, f'{path}_cache_data')
+        
+        path = f"{checkpoint_dir}/0.0" # Based on the generated files in ./model/
+        
+        state_dict = torch.load(f'{path}_state', map_location='cpu')
+        model.load_state_dict(state_dict)
+        
+        model.cache_data = torch.load(f'{path}_cache_data', map_location='cpu')
+        
+        print(f"Model berhasil dimuat dari {checkpoint_dir}")
+        return model
+    except Exception as e:
+        print(f"Error memuat model: {e}")
+        return None
+
+def run_inference():
+    # 1. Fetch data
+    print("Fetching latest data for inference...")
+    df = data_utils.fetch_data()
+    df = data_utils.compute_bollinger(df)
     
-    # 2. Load KAN Model
-    print("Loading KAN model...")
-    # Initialize with same width as training, auto_save=False to avoid unwanted folder creation
-    kan_model = KAN(width=[len(features), 8, 3], grid=3, k=3, auto_save=False)
-    kan_model.loadckpt(path="./model/kan_model.ckpt")
+    # 2. Preprocess (need to ensure features match training)
+    # Note: In production, normalization stats (X_mean, X_std) 
+    # should be saved during training and reloaded here!
     
-    # KAN Prediction
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+    _, _, df_ready = data_utils.create_dataset(df)
+
+    # print(df_ready.head().to_string())
+    
+    # Ambil data terbaru (terakhir)
+    latest_data = df_ready.iloc[[-1]]
+    features = ['bb_pct_scaled', 'return_lag_1', 'return_lag_2', 
+                'rolling_mean_return_5', 'rolling_vol_5', 'ratio_to_1w', 'ratio_to_1m']
+    
+    X = torch.tensor(latest_data[features].values, dtype=torch.float32)
+    
+    # 3. Load Model & Stats
+    model = load_deployed_model()
+    X_mean, X_std = model_utils.load_normalization_stats()
+    
+    if model is None:
+        return
+
+    # 4. Predict
+    # Apply normalization using saved stats
+    X_norm = model_utils.normalize_data(X, X_mean, X_std)
     
     with torch.no_grad():
-        kan_preds = kan_model(X_tensor)
-        kan_classes = torch.argmax(kan_preds, dim=1).numpy()
+        # Using sigmoid to get probability
+        pred = torch.sigmoid(model(X_norm)).item()
     
-    # 3. Load TFT model
-    print("Loading TFT model...")
-    tft_model = TemporalFusionTransformer.load_from_checkpoint("./model/tft_model.ckpt", map_location="cpu")
-    tft_model.eval()
+    status = "Buy" if pred > 0.6 else "Sell" if pred < 0.4 else "Hold"
     
-    # TFT Prediction - Use TimeSeriesDataSet for correct formatting
-    from pytorch_forecasting import TimeSeriesDataSet
+    # Calculate SL/TP levels based on Bollinger Bands
+    price = latest_data['close_1d'].item()
+    upper = latest_data['bb_upper'].item()
+    lower = latest_data['bb_lower'].item()
     
-    # Use the same parameters as training
-    max_encoder_length = 24
-    # We need a dummy target for the dataset creation, even if not used for prediction
-    df['target'] = 0 
+    print(f"\nPrediksi Terbaru: Probabilitas Buy = {pred:.4f} -> {status}")
     
-    try:
-        # Load saved dataset parameters
-        import pickle
-        with open("./model/dataset_params.pkl", "rb") as f:
-            ds_params = pickle.load(f)
+    if status != "Hold":
+        entry = price
+        sl = lower if status == "Buy" else upper
+        tp = upper if status == "Buy" else lower
         
-        # Manually create the dataset using the parameters
-        inference_ds = TimeSeriesDataSet(
-            df,
-            **ds_params
-        )
-        inf_loader = inference_ds.to_dataloader(train=False, batch_size=len(df), num_workers=0)
-        
-        batch = next(iter(inf_loader))
-        x, _ = batch
-        
-        with torch.no_grad():
-            output = tft_model(x)
-            # output is likely a namedtuple or dict depending on version
-            # Usually .prediction or ['prediction']
-            if hasattr(output, 'prediction'):
-                logits = output.prediction
-            else:
-                logits = output
-                
-            # If logits has shape (Batch, Horizon, Classes), take last horizon (which is 1)
-            if len(logits.shape) == 3:
-                logits = logits[:, -1, :]
-            
-            tft_classes = torch.argmax(logits, dim=-1).numpy()
-            
-            # Pad with -1 for points where we didn't have enough encoder history
-            padding_needed = len(df) - len(tft_classes)
-            if padding_needed > 0:
-                tft_classes = np.pad(tft_classes, (padding_needed, 0), constant_values=-1)
-            elif padding_needed < 0:
-                tft_classes = tft_classes[-len(df):]
-                
-    except Exception as e:
-        print(f"TFT Prediction failed: {e}")
-        tft_classes = np.zeros(len(df)) - 1
-    
-    # 4. Comparative Output
-    # Align lengths (TFT might have different length due to encoder_length)
-    # For simplicity, we just look at the last few points
-    results = pd.DataFrame({
-        'Timestamp': df.index,
-        'Price': df['Close'],
-        'KAN_Signal': kan_classes,
-        'TFT_Signal': tft_classes[-len(df):] if len(tft_classes) >= len(df) else np.pad(tft_classes, (len(df)-len(tft_classes), 0), constant_values=-1)
-    })
-    
-    # Signal mapping: 0: Sell/Loss, 1: Hold/Timeout, 2: Buy/Profit
-    signal_map = {0: "SELL", 1: "HOLD", 2: "BUY", -1: "N/A"}
-    results['KAN_Action'] = results['KAN_Signal'].map(signal_map)
-    results['TFT_Action'] = results['TFT_Signal'].map(signal_map)
-    
-    print("\nRecent Comparative Inference Results:")
-    print(results[['Timestamp', 'Price', 'KAN_Action', 'TFT_Action']].tail(10))
+        print(f"--- Trading Plan ---")
+        print(f"Entry      : {entry:.2f}")
+        print(f"Stop Loss  : {sl:.2f}")
+        print(f"Take Profit: {tp:.2f}")
 
 if __name__ == "__main__":
-    run_inference(ticker="JPFA.JK")
+    run_inference()
